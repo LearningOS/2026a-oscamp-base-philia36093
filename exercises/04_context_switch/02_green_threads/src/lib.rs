@@ -137,7 +137,22 @@ impl Scheduler {
     ///    `sp` must be 16-byte aligned (e.g. `(stack_top - 16) & !15` to leave headroom).
     /// 3. Push a `GreenThread` with this context, state `Ready`, and `entry` stored for the wrapper to call.
     pub fn spawn(&mut self, entry: extern "C" fn()) {
-        todo!("alloc stack, init ctx with ra=thread_wrapper and aligned sp, push GreenThread(Ready, entry)")
+        // 1. Allocate stack; high address is stack_top (stack grows down).
+        let buf = vec![0u8; STACK_SIZE];
+        let stack_top = buf.as_ptr() as usize + STACK_SIZE;
+        // 2. Initial context: first `ret` jumps to thread_wrapper; sp 16-byte aligned
+        //    with 16 bytes of headroom at the top.
+        let sp = (stack_top - 16) & !0xF;
+        let mut ctx = TaskContext::default();
+        ctx.sp = sp as u64;
+        ctx.ra = thread_wrapper as usize as u64;
+        // 3. Register the thread as Ready; `entry` is handed to the wrapper on first run.
+        self.threads.push(GreenThread {
+            ctx,
+            state: ThreadState::Ready,
+            _stack: Some(buf),
+            entry: Some(entry),
+        });
     }
 
     /// Run the scheduler until all threads (except the main one) are `Finished`.
@@ -146,12 +161,71 @@ impl Scheduler {
     /// 2. Loop: if all threads in `threads[1..]` are `Finished`, break; otherwise call `schedule_next()` (which may switch away and later return).
     /// 3. Clear `SCHEDULER` when done.
     pub fn run(&mut self) {
-        todo!("set SCHEDULER to self, loop until threads[1..] all Finished, call schedule_next, then clear SCHEDULER")
+        // 1. Publish self so yield_now / thread_finished can call back into the scheduler.
+        unsafe {
+            SCHEDULER = self as *mut Scheduler;
+        }
+        // 2. Keep scheduling until every spawned thread (threads[1..]) is Finished.
+        loop {
+            let alive = self.threads[1..]
+                .iter()
+                .any(|t| t.state != ThreadState::Finished);
+            if !alive {
+                break;
+            }
+            // schedule_next() may switch away and return later when another thread
+            // switches back to this (main) context.
+            self.schedule_next();
+        }
+        // 3. Clear the global pointer on the way out.
+        unsafe {
+            SCHEDULER = std::ptr::null_mut();
+        }
     }
 
     /// Find the next ready thread (starting from `current + 1` round-robin), mark current as `Ready` (if not `Finished`), mark next as `Running`, set `CURRENT_THREAD_ENTRY` if the next thread has an entry, then switch to it.
     fn schedule_next(&mut self) {
-        todo!("round-robin find next Ready, set current Ready (if not Finished), next Running, CURRENT_THREAD_ENTRY, then switch_context")
+        let n = self.threads.len();
+        // Round-robin: scan starting just after the current thread.
+        let mut next_idx: Option<usize> = None;
+        for i in 1..=n {
+            let idx = (self.current + i) % n;
+            if self.threads[idx].state == ThreadState::Ready {
+                next_idx = Some(idx);
+                break;
+            }
+        }
+        let next_idx = match next_idx {
+            Some(i) => i,
+            // No ready thread: nothing to do (run() only calls us while some thread is alive).
+            None => return,
+        };
+
+        let old_idx = self.current;
+        // The thread we are leaving becomes Ready, unless it has already Finished.
+        if self.threads[old_idx].state != ThreadState::Finished {
+            self.threads[old_idx].state = ThreadState::Ready;
+        }
+        self.threads[next_idx].state = ThreadState::Running;
+
+        // Hand the user entry to thread_wrapper iff this thread is starting for the
+        // first time (resuming threads already consumed their entry).
+        let next_entry = self.threads[next_idx].entry;
+        if let Some(e) = next_entry {
+            unsafe {
+                CURRENT_THREAD_ENTRY = Some(e);
+            }
+        }
+
+        self.current = next_idx;
+
+        // Switch: save current (old_idx) context, load next (next_idx) context.
+        // Use raw pointers to split two distinct `&mut` indices without aliasing.
+        unsafe {
+            let old_ptr = &mut self.threads[old_idx] as *mut GreenThread;
+            let new_ptr = &self.threads[next_idx] as *const GreenThread;
+            switch_context(&mut (*old_ptr).ctx, &(*new_ptr).ctx);
+        }
     }
 }
 
